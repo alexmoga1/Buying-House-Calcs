@@ -1,5 +1,4 @@
 # app.py
-# Streamlit version of your interactive vacation rental mortgage coverage model.
 # Run: streamlit run app.py
 
 import numpy as np
@@ -8,10 +7,9 @@ import streamlit as st
 import altair as alt
 
 # ----------------------------
-# Defaults (from your sheet)
+# Defaults (your sheet)
 # ----------------------------
 RENTABLE_NIGHTS_PER_YEAR = 356
-COGS_ANNUAL_Y1_DEFAULT = 9_300.00
 
 DEFAULTS = dict(
     home_price=1_200_000.00,
@@ -19,31 +17,30 @@ DEFAULTS = dict(
     mortgage_rate_apr=0.06,
     term_years=30,
     mgmt_fee=0.35,
+
     nightly_rate=500.0,
     vacancy_rate=0.50,     # % vacant
-    rent_growth=0.03,
-    cogs_inflation=0.02,
-    cogs_annual_y1=COGS_ANNUAL_Y1_DEFAULT,
+    rent_growth=0.03,      # annual
+    cogs_inflation=0.02,   # annual
+    cogs_annual_y1=9_300.00,
+
+    reinvest_pct=1.00,     # 100% -> all surplus to extra principal
 )
 
 # ----------------------------
-# Math
+# Core mortgage helpers
 # ----------------------------
-def annual_mortgage_payment(home_price: float, down_payment_pct: float, apr: float, term_years: int) -> float:
-    """Annual P+I payment for an amortizing mortgage. Returns positive magnitude."""
-    principal = home_price * (1.0 - down_payment_pct)
-    n = int(round(term_years * 12))
+def monthly_payment(principal: float, apr: float, term_years: int) -> float:
+    """Standard amortizing mortgage monthly payment (P+I)."""
+    n = int(term_years * 12)
     if n <= 0:
         return float("nan")
     r = apr / 12.0
     if abs(r) < 1e-12:
-        monthly = principal / n
-    else:
-        monthly = principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
-    return monthly * 12.0
+        return principal / n
+    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
-
-def build_df(
+def simulate(
     home_price: float,
     down_payment_pct: float,
     apr: float,
@@ -54,44 +51,116 @@ def build_df(
     rent_growth: float,
     cogs_inflation: float,
     cogs_annual_y1: float,
+    reinvest_pct: float,
 ) -> pd.DataFrame:
+    """
+    Month-by-month simulation:
+    - rent & cogs are constant within a year, then step up each year by growth/inflation
+    - mortgage is fixed-rate minimum payment, plus extra principal from reinvestment
+    """
     years = int(max(1, round(term_years)))
-    y = np.arange(1, years + 1)
+    months = years * 12
 
-    mortgage_annual = annual_mortgage_payment(home_price, down_payment_pct, apr, term_years)
+    loan0 = home_price * (1 - down_payment_pct)
+    bal = loan0
 
-    # Year 1 rent BEFORE management fee (matches your sheet logic)
+    pmt_min = monthly_payment(loan0, apr, years)
+
+    out_of_pocket_year = np.zeros(years)
+    takehome_profit_year = np.zeros(years)
+    extra_principal_year = np.zeros(years)
+    interest_paid_year = np.zeros(years)
+    principal_paid_year = np.zeros(years)
+    end_balance_year = np.zeros(years)
+    cash_available_year = np.zeros(years)
+    total_rent_year = np.zeros(years)
+
+    # Precompute year-level rent/cogs based on your formula
+    # Year1 Total Rent (before mgmt fee): nightly * rentable_nights * (1 - vacancy)
     total_rent_y1 = nightly_rate * RENTABLE_NIGHTS_PER_YEAR * (1 - vacancy_rate)
 
-    total_rent = total_rent_y1 * (1 + rent_growth) ** (y - 1)
-    mgmt_fee_cost = total_rent * mgmt_fee
-    net_after_fee = total_rent - mgmt_fee_cost
+    for year_idx in range(years):
+        # Year-level (growing each year)
+        yr = year_idx + 1
+        total_rent = total_rent_y1 * (1 + rent_growth) ** year_idx
+        cogs = cogs_annual_y1 * (1 + cogs_inflation) ** year_idx
 
-    cogs = cogs_annual_y1 * (1 + cogs_inflation) ** (y - 1)
+        mgmt_cost = total_rent * mgmt_fee
+        net_after_fee = total_rent - mgmt_cost
+        cash_available = net_after_fee - cogs
 
-    cash_available = net_after_fee - cogs
-    out_of_pocket = mortgage_annual - cash_available
-    cumulative_out_of_pocket = np.cumsum(out_of_pocket)
+        total_rent_year[year_idx] = total_rent
+        cash_available_year[year_idx] = cash_available
 
-    df = pd.DataFrame(
-        {
-            "Year": y,
-            "Total Rent": total_rent,
-            "Mgmt Fee Cost": mgmt_fee_cost,
-            "COGS": cogs,
-            "Cash Available": cash_available,
-            "Mortgage (Annual P+I)": mortgage_annual,
-            "Out of Pocket": out_of_pocket,
-            "Cumulative Out of Pocket": cumulative_out_of_pocket,
-        }
-    )
+        cash_m = cash_available / 12.0
+
+        # Simulate 12 months for this year (or until paid off)
+        for _m in range(12):
+            if bal <= 1e-6:
+                break
+
+            r_m = apr / 12.0
+            interest = bal * r_m
+            principal_min = max(0.0, pmt_min - interest)
+
+            # If final payment would overshoot, cap it
+            if principal_min > bal:
+                principal_min = bal
+                actual_pmt = interest + principal_min
+            else:
+                actual_pmt = pmt_min
+
+            # Monthly surplus after paying minimum (if any)
+            monthly_surplus = max(0.0, cash_m - actual_pmt)
+            monthly_shortfall = max(0.0, actual_pmt - cash_m)
+
+            # Reinvestment: use a fraction of surplus as extra principal
+            extra_principal = monthly_surplus * reinvest_pct
+            # Takehome profit: remainder of surplus
+            takehome_profit = monthly_surplus * (1.0 - reinvest_pct)
+
+            # Extra principal cannot exceed remaining balance after min principal
+            extra_principal = min(extra_principal, max(0.0, bal - principal_min))
+
+            # Update totals
+            out_of_pocket_year[year_idx] += monthly_shortfall
+            takehome_profit_year[year_idx] += takehome_profit
+            extra_principal_year[year_idx] += extra_principal
+            interest_paid_year[year_idx] += interest
+            principal_paid_year[year_idx] += principal_min + extra_principal
+
+            # Reduce balance
+            bal -= (principal_min + extra_principal)
+
+        end_balance_year[year_idx] = max(0.0, bal)
+
+    # Mortgage paid each year (minimum + extra principal; not including out-of-pocket coverage logic)
+    # For reporting: "Mortgage P+I paid from property cash + out-of-pocket" is less intuitive here,
+    # so we expose interest/principal and balance directly.
+    df = pd.DataFrame({
+        "Year": np.arange(1, years + 1),
+        "Total Rent": total_rent_year,
+        "Cash Available": cash_available_year,
+        "Out of Pocket": out_of_pocket_year,
+        "Takehome Profit": takehome_profit_year,
+        "Extra Principal Paid": extra_principal_year,
+        "Interest Paid": interest_paid_year,
+        "Principal Paid": principal_paid_year,
+        "Ending Balance": end_balance_year,
+    })
+
+    df["Cumulative Out of Pocket"] = df["Out of Pocket"].cumsum()
+
+    # Payoff year (first year ending balance hits 0)
+    payoff = df.index[df["Ending Balance"] <= 1e-6]
+    df.attrs["payoff_year"] = int(df.loc[payoff[0], "Year"]) if len(payoff) else None
+    df.attrs["loan_amount"] = loan0
+    df.attrs["monthly_payment_min"] = pmt_min
     return df
 
-
 def first_breakeven_year(df: pd.DataFrame):
-    hit = df.loc[df["Out of Pocket"] <= 0, "Year"]
+    hit = df.loc[df["Out of Pocket"] <= 1e-6, "Year"]
     return int(hit.iloc[0]) if len(hit) else None
-
 
 # ----------------------------
 # Streamlit UI
@@ -107,19 +176,22 @@ with st.sidebar:
     mgmt_fee = st.number_input("Mgmt Fee (%)", min_value=0.0, max_value=80.0, value=float(DEFAULTS["mgmt_fee"] * 100), step=0.5, format="%.2f") / 100.0
 
     st.divider()
-    st.subheader("Compact knobs (sliders)")
+    st.subheader("Compact controls (sliders)")
     nightly_rate = st.slider("Nightly Rate ($)", min_value=50, max_value=1500, value=int(DEFAULTS["nightly_rate"]), step=10)
     vacancy_rate = st.slider("Vacancy (%)", min_value=0, max_value=95, value=int(DEFAULTS["vacancy_rate"] * 100), step=1) / 100.0
     rent_growth = st.slider("Rent Growth (%/yr)", min_value=-5.0, max_value=15.0, value=float(DEFAULTS["rent_growth"] * 100), step=0.5) / 100.0
     cogs_inflation = st.slider("COGS Inflation (%/yr)", min_value=0.0, max_value=15.0, value=float(DEFAULTS["cogs_inflation"] * 100), step=0.5) / 100.0
-
-    # Optional: make this typable too (helps reality)
     cogs_annual_y1 = st.number_input("COGS Year 1 ($/yr)", min_value=0.0, value=float(DEFAULTS["cogs_annual_y1"]), step=500.0, format="%.2f")
-
     down_payment_pct = st.slider("Down Payment (%)", min_value=0, max_value=80, value=int(DEFAULTS["down_payment_pct"] * 100), step=1) / 100.0
 
+    reinvest_pct = st.slider(
+        "Reinvest Surplus to Principal (%)",
+        min_value=0, max_value=100,
+        value=int(DEFAULTS["reinvest_pct"] * 100),
+        step=5
+    ) / 100.0
 
-df = build_df(
+df = simulate(
     home_price=home_price,
     down_payment_pct=down_payment_pct,
     apr=mortgage_rate_apr,
@@ -130,107 +202,103 @@ df = build_df(
     rent_growth=rent_growth,
     cogs_inflation=cogs_inflation,
     cogs_annual_y1=cogs_annual_y1,
+    reinvest_pct=reinvest_pct,
 )
 
 breakeven = first_breakeven_year(df)
+payoff_year = df.attrs.get("payoff_year")
+loan_amount = df.attrs.get("loan_amount")
+pmt_min = df.attrs.get("monthly_payment_min")
 
-# Key metrics (Year 1)
 y1 = df.iloc[0]
-loan_amount = home_price * (1 - down_payment_pct)
-mortgage_annual = float(y1["Mortgage (Annual P+I)"])
-total_rent_y1 = float(y1["Total Rent"])
-cash_available_y1 = float(y1["Cash Available"])
-oop_y1 = float(y1["Out of Pocket"])
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Loan Amount", f"${loan_amount:,.0f}")
-c2.metric("Mortgage (Annual P+I)", f"${mortgage_annual:,.0f}")
-c3.metric("Total Rent (Year 1)", f"${total_rent_y1:,.0f}")
-c4.metric("Cash Available (Year 1)", f"${cash_available_y1:,.0f}")
-c5.metric("Break-even Year", "Not within term" if breakeven is None else f"Year {breakeven}")
+c2.metric("Min Mortgage Pmt (monthly)", f"${pmt_min:,.0f}")
+c3.metric("Cash Available (Year 1)", f"${y1['Cash Available']:,.0f}")
+c4.metric("Out-of-Pocket (Year 1)", f"${y1['Out of Pocket']:,.0f}")
+c5.metric("Takehome Profit (Year 1)", f"${y1['Takehome Profit']:,.0f}")
+c6.metric("Payoff Year", "No payoff" if payoff_year is None else f"Year {payoff_year}")
 
 tabs = st.tabs(["Summary Charts", "Year-by-Year View"])
 
+zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule().encode(y="y:Q")
+
 with tabs[0]:
-    left, right = st.columns([1.1, 0.9])
+    left, right = st.columns([1.2, 0.8])
 
     with left:
         st.subheader("Out-of-Pocket Per Year")
         chart1 = (
             alt.Chart(df)
             .mark_line()
-            .encode(x="Year:Q", y=alt.Y("Out of Pocket:Q", title="$/year"), tooltip=["Year", "Out of Pocket"])
+            .encode(
+                x="Year:Q",
+                y=alt.Y("Out of Pocket:Q", title="$/year (+you pay, -surplus)"),
+                tooltip=["Year", alt.Tooltip("Out of Pocket:Q", format=",.0f")]
+            )
         )
-        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule().encode(y="y:Q")
         st.altair_chart((chart1 + zero_line).interactive(), use_container_width=True)
+
+        st.subheader("Takehome Profit Per Year")
+        # Bar chart is best here
+        profit_bar = (
+            alt.Chart(df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Year:O", title="Year"),
+                y=alt.Y("Takehome Profit:Q", title="$/year"),
+                tooltip=["Year", alt.Tooltip("Takehome Profit:Q", format=",.0f")]
+            )
+        )
+        st.altair_chart(profit_bar.interactive(), use_container_width=True)
 
     with right:
         st.subheader("Cumulative Out-of-Pocket")
         chart2 = (
             alt.Chart(df)
             .mark_line()
-            .encode(x="Year:Q", y=alt.Y("Cumulative Out of Pocket:Q", title="Cumulative $"), tooltip=["Year", "Cumulative Out of Pocket"])
+            .encode(
+                x="Year:Q",
+                y=alt.Y("Cumulative Out of Pocket:Q", title="Cumulative $"),
+                tooltip=["Year", alt.Tooltip("Cumulative Out of Pocket:Q", format=",.0f")]
+            )
         )
         st.altair_chart((chart2 + zero_line).interactive(), use_container_width=True)
 
-with tabs[1]:
-    st.subheader("Breakdown & Table")
-
-    top1, top2 = st.columns([1, 1])
-
-    # Rent breakdown stacked (Rent positive, costs negative)
-    df_stack = df[["Year", "Total Rent", "Mgmt Fee Cost", "COGS"]].copy()
-    df_stack = df_stack.melt("Year", var_name="Component", value_name="Amount")
-    # Make costs negative for intuitive stacking
-    df_stack.loc[df_stack["Component"].isin(["Mgmt Fee Cost", "COGS"]), "Amount"] *= -1
-
-    with top1:
-        st.caption("Stacked: Total Rent, -Mgmt Fee, -COGS")
-        chart_stack = (
-            alt.Chart(df_stack)
-            .mark_area()
-            .encode(
-                x="Year:Q",
-                y=alt.Y("Amount:Q", title="$/year"),
-                color="Component:N",
-                tooltip=["Year", "Component", alt.Tooltip("Amount:Q", format=",.0f")],
-            )
-        )
-        st.altair_chart((chart_stack + zero_line).interactive(), use_container_width=True)
-
-    with top2:
-        st.caption("Coverage: Cash Available vs Mortgage")
-        df_cov = df[["Year", "Cash Available", "Mortgage (Annual P+I)"]].melt("Year", var_name="Series", value_name="Amount")
-        chart_cov = (
-            alt.Chart(df_cov)
+        st.subheader("Ending Mortgage Balance")
+        bal = (
+            alt.Chart(df)
             .mark_line()
             .encode(
                 x="Year:Q",
-                y=alt.Y("Amount:Q", title="$/year"),
-                color="Series:N",
-                tooltip=["Year", "Series", alt.Tooltip("Amount:Q", format=",.0f")],
+                y=alt.Y("Ending Balance:Q", title="Balance ($)"),
+                tooltip=["Year", alt.Tooltip("Ending Balance:Q", format=",.0f")]
             )
         )
-        st.altair_chart((chart_cov + zero_line).interactive(), use_container_width=True)
+        st.altair_chart(bal.interactive(), use_container_width=True)
 
-    st.divider()
+with tabs[1]:
+    st.subheader("Year-by-Year Table")
     st.dataframe(
-        df.style.format(
-            {
-                "Total Rent": "${:,.0f}",
-                "Mgmt Fee Cost": "${:,.0f}",
-                "COGS": "${:,.0f}",
-                "Cash Available": "${:,.0f}",
-                "Mortgage (Annual P+I)": "${:,.0f}",
-                "Out of Pocket": "${:,.0f}",
-                "Cumulative Out of Pocket": "${:,.0f}",
-            }
-        ),
+        df.style.format({
+            "Total Rent": "${:,.0f}",
+            "Cash Available": "${:,.0f}",
+            "Out of Pocket": "${:,.0f}",
+            "Takehome Profit": "${:,.0f}",
+            "Extra Principal Paid": "${:,.0f}",
+            "Interest Paid": "${:,.0f}",
+            "Principal Paid": "${:,.0f}",
+            "Ending Balance": "${:,.0f}",
+            "Cumulative Out of Pocket": "${:,.0f}",
+        }),
         use_container_width=True,
-        height=420,
+        height=520,
     )
 
 st.caption(
-    "Interpretation: Out-of-Pocket > 0 means you cover the gap; < 0 means surplus. "
-    "Break-even year is the first year Out-of-Pocket goes <= 0."
+    "Definitions: Cash Available = (Rent after mgmt fee) − COGS. "
+    "Out-of-Pocket is the gap when cash available can’t cover the mortgage payment. "
+    "Takehome Profit is the portion of surplus not reinvested into extra principal. "
+    "Reinvest slider controls what fraction of surplus becomes extra principal (0% = keep it, 100% = pay down faster)."
 )
